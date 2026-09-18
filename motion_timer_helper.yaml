@@ -1,0 +1,184 @@
+blueprint:
+  name: Turn on light/switch with motion, off via restart-safe timer helper
+  description: >
+    Turns on a light, switch, or scene based on motion, and turns it off after
+    a configurable delay using a timer helper instead of an in-automation
+    delay/wait — so the pending turn-off survives a Home Assistant restart.
+    Forked in spirit from freakshock88/motion_illuminance_activated_entity.yaml.
+  domain: automation
+  input:
+    motion_sensor:
+      name: Motion Sensor
+      selector:
+        entity:
+    target_entity:
+      name: Target entity
+      description: The light, switch, or scene to turn on when motion is detected.
+      selector:
+        entity:
+    no_motion_timer:
+      name: No-motion timer helper
+      description: >
+        A timer helper dedicated to this automation. Do not share one timer
+        across multiple instances of this blueprint.
+      selector:
+        entity:
+          domain: timer
+    no_motion_wait:
+      name: (OPTIONAL) Turn off wait time (minutes)
+      default:
+      selector:
+        entity:
+          domain: input_number
+    target_off_entity:
+      name: (OPTIONAL) Turn-off entity
+      default:
+      selector:
+        entity:
+    illuminance_sensor:
+      name: (OPTIONAL) Illuminance sensor
+      default:
+      selector:
+        entity:
+          domain: sensor
+          device_class: illuminance
+    illuminance_cutoff:
+      name: (OPTIONAL) Illuminance cutoff value
+      default:
+      selector:
+        entity:
+          domain: input_number
+    blocker_entity:
+      name: (OPTIONAL) Blocking entity
+      default:
+      selector:
+        entity:
+    turn_off_blocker_entity:
+      name: (OPTIONAL) Turn-off blocking entity
+      default:
+      selector:
+        entity:
+    time_limit_before:
+      name: (OPTIONAL) Only run before time
+      default:
+      selector:
+        entity:
+          domain: input_datetime
+    time_limit_after:
+      name: (OPTIONAL) Only run after time
+      default:
+      selector:
+        entity:
+          domain: input_datetime
+
+mode: queued
+max: 10
+
+variables:
+  target_entity: !input target_entity
+  target_off_entity: !input target_off_entity
+  no_motion_timer: !input no_motion_timer
+  no_motion_wait: !input no_motion_wait
+  illuminance_currently: !input illuminance_sensor
+  illuminance_cutoff: !input illuminance_cutoff
+  blocker_entity: !input blocker_entity
+  turn_off_blocker_entity: !input turn_off_blocker_entity
+  time_limit_before: !input time_limit_before
+  time_limit_after: !input time_limit_after
+  entity_domain: "{{ states[target_entity].domain }}"
+
+triggers:
+  - trigger: state
+    entity_id: !input motion_sensor
+    to: "on"
+    id: motion_on
+  - trigger: state
+    entity_id: !input motion_sensor
+    to: "off"
+    id: motion_off
+  - trigger: event
+    event_type: timer.finished
+    event_data:
+      entity_id: !input no_motion_timer
+    id: timer_finished
+
+conditions: []
+
+actions:
+  - choose:
+      - alias: "Motion detected - check conditions and turn on"
+        conditions:
+          - condition: trigger
+            id: motion_on
+        sequence:
+          - action: timer.cancel
+            target:
+              entity_id: !input no_motion_timer
+          - if:
+              - condition: template
+                alias: "Illuminance / blocker / time-limit checks"
+                value_template: >
+                  {% set illuminance_defined = illuminance_currently != none and illuminance_cutoff != none %}
+                  {% set illuminance_low = illuminance_defined and (states(illuminance_currently) | int(0) < states(illuminance_cutoff) | int(0)) %}
+                  {% set illuminance_ok = not illuminance_defined or illuminance_low %}
+                  {% set blocker_ok = (blocker_entity == none) or (states(blocker_entity) == 'off') %}
+                  {% set current_time = now().strftime("%H:%M") %}
+                  {% if time_limit_before == none and time_limit_after == none %}
+                    {% set time_ok = true %}
+                  {% elif time_limit_before != none and time_limit_after == none %}
+                    {% set time_ok = current_time < states(time_limit_before) %}
+                  {% elif time_limit_before == none and time_limit_after != none %}
+                    {% set time_ok = current_time > states(time_limit_after) %}
+                  {% else %}
+                    {% set spans_midnight = states(time_limit_after) > states(time_limit_before) %}
+                    {% if spans_midnight %}
+                      {% set time_ok = current_time > states(time_limit_after) or current_time < states(time_limit_before) %}
+                    {% else %}
+                      {% set time_ok = current_time > states(time_limit_after) and current_time < states(time_limit_before) %}
+                    {% endif %}
+                  {% endif %}
+                  {{ illuminance_ok and blocker_ok and time_ok }}
+            then:
+              - action: homeassistant.turn_on
+                target:
+                  entity_id: !input target_entity
+
+      - alias: "Motion cleared - start or skip timer"
+        conditions:
+          - condition: trigger
+            id: motion_off
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ no_motion_wait != none }}"
+            then:
+              - action: timer.start
+                target:
+                  entity_id: !input no_motion_timer
+                data:
+                  duration: >
+                    {% set m = states(no_motion_wait) | int(0) %}
+                    {{ '%02d:%02d:00' | format(m // 60, m % 60) }}
+            else:
+              - if:
+                  - condition: template
+                    value_template: "{{ (turn_off_blocker_entity == none) or (states(turn_off_blocker_entity) == 'off') }}"
+                then:
+                  - action: homeassistant.turn_off
+                    target:
+                      entity_id: >
+                        {{ target_off_entity if target_off_entity != none else target_entity }}
+
+      - alias: "Timer finished - turn off"
+        conditions:
+          - condition: trigger
+            id: timer_finished
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ (turn_off_blocker_entity == none) or (states(turn_off_blocker_entity) == 'off') }}"
+            then:
+              - action: homeassistant.turn_off
+                target:
+                  entity_id: >
+                    {{ target_off_entity if target_off_entity != none else target_entity }}
